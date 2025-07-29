@@ -59,7 +59,7 @@ MEANFLOW_CONFIG = dict(
 )
 
 ALPHA_CONFIG = dict(
-    final_alpha = 0.5, 
+    final_alpha = 0.5,
     final_epoch = 0.9 * EXPERIMENT_CONFIG['num_epochs']
 )
 
@@ -88,6 +88,31 @@ def save_img(m, f, name, accelerator, config, epoch):
     mod = m.module if hasattr(m, 'module') else m
     img = f.sample(mod, accelerator.device, use_cond=config['use_cond'])
     save_image(make_grid(img, nrow=10), f'Compare_Reports/images/{name}_epoch_{epoch+1}.png')
+
+def sample_and_save(model, flow, name, accelerator, config, epoch):
+    save_img(model, flow, name, accelerator, config, epoch)
+    mod = model.module if hasattr(model, 'module') else model
+    imgs = flow.sample(mod, accelerator.device, use_cond=config['use_cond'], n=2000)
+    return imgs
+
+def update_best(fid, best_fid, model, add_model, accelerator):
+    if fid < best_fid:
+        best_fid = fid
+        # 只保存 MeanFlow 的参数
+        torch.save(model.state_dict(), 'Compare_Reports/best_meanflow.pth')
+        add_model.load_state_dict(model.state_dict())
+        if accelerator.is_main_process:
+            print(f"New best MeanFlow FID: {best_fid:.2f}, model saved.")
+    return best_fid
+
+def update_add_best(fid, best_add_fid, add_model, accelerator):
+    if fid < best_add_fid:
+        best_add_fid = fid
+        # 只保存 AdditiveMeanFlow 的参数
+        torch.save(add_model.state_dict(), 'Compare_Reports/best_additive_meanflow.pth')
+        if accelerator.is_main_process:
+            print(f"New best AdditiveMeanFlow FID: {best_add_fid:.2f}, model saved.")
+    return best_add_fid
 
 def train(model, add_model, flow, add_flow, dataloader, accelerator, config, alpha_config):
     optimizer = torch.optim.Adam(model.parameters(),
@@ -147,43 +172,27 @@ def train(model, add_model, flow, add_flow, dataloader, accelerator, config, alp
             print(f"Epoch {epoch+1}/{n_epochs}, Loss: {losses[-1]:.4f},AddLoss: {add_losses[-1]:.4f}, LR: {lrs[-1]:.6f}, Alpha: {cur_alpha:.2f}, Time: {epoch_time:.2f}s")
         
         if (epoch + 1) % config['sample_epoch'] == 0:
+            begin_time = time.time()
             ema.apply_shadow()
             add_ema.apply_shadow()
             model.eval()
             add_model.eval()
             with torch.no_grad():
-                save_img(model, flow, "MeanFlow", accelerator, config, epoch)
-                save_img(add_model, add_flow, "AdditiveMeanFlow", accelerator, config, epoch)
+                fake_imgs = sample_and_save(model, flow, "MeanFlow", accelerator, config, epoch)
+                add_fake_imgs = sample_and_save(add_model, add_flow, "AdditiveMeanFlow", accelerator, config, epoch)
+                real_images = get_real_images(DATA_CONFIG['dataset_type'], DATA_CONFIG['image_size'], batch_size=256, num_images=10000).to(accelerator.device)
                 
-                begin_time = time.time()
-                mod = model.module if hasattr(model, 'module') else model
-                add_mod = add_model.module if hasattr(add_model, 'module') else add_model
-                fake_imgs = flow.sample(mod, accelerator.device, use_cond=config['use_cond'], n=2000)
-                add_fake_imgs = add_flow.sample(add_mod, accelerator.device, use_cond=config['use_cond'], n=2000)
-                # 加载真实图片
-                real_images = get_real_images(
-                    DATA_CONFIG['dataset_type'],
-                    DATA_CONFIG['image_size'],
-                    batch_size=256,
-                    num_images=10000
-                ).to(accelerator.device)
             fid = calculate_fid(real_images=real_images, fake_images=fake_imgs, device=accelerator.device)
             add_fid = calculate_fid(real_images=real_images, fake_images=add_fake_imgs, device=accelerator.device)
             end_time = time.time() - begin_time
             fids.append(fid)
             add_fids.append(add_fid)
+            
             if accelerator.is_main_process:
                 print(f"Epoch {epoch+1}: MeanFlow FID={fid:.2f}, AdditiveMeanFlow FID={add_fid:.2f}, Time: {end_time:.2f}s")
-            if fid < best_fid:
-                best_fid = fid
-                accelerator.save_state(f'Compare_Reports/best_meanflow.pth')
-                if accelerator.is_main_process:
-                    print(f"New best MeanFlow FID: {best_fid:.2f}, model saved.")
-            if add_fid < best_add_fid:
-                best_add_fid = add_fid
-                accelerator.save_state(f'Compare_Reports/best_additive_meanflow.pth')
-                if accelerator.is_main_process:
-                    print(f"New best AdditiveMeanFlow FID: {best_add_fid:.2f}, model saved.")
+                
+            best_fid = update_best(fid, best_fid, model, add_model, accelerator)
+            best_add_fid = update_add_best(add_fid, best_add_fid, add_model, accelerator)
             torch.cuda.empty_cache()
         
         ema.restore()
